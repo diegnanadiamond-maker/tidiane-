@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>JOSPIA / AEEMCI — Gestion Séminaristes</title>
+
+  <!-- Bootstrap -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet"/>
+
+  <!-- XLSX for import/export -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <style>
+    body { background:#f4f6f9; }
+    .sidebar { width:300px; height:100vh; position:fixed; left:0; top:0; padding:1rem; background:#0d6efd; color:#fff; overflow:auto;}
+    .main { margin-left:320px; padding:1.5rem; min-height:100vh; }
+    .nav-link { color:rgba(255,255,255,0.95); cursor:pointer; }
+    .nav-link:hover { color:#fff; text-decoration:none; }
+    .thumb { width:48px;height:48px;object-fit:cover;border-radius:6px;border:1px solid #ddd; }
+    .table-fixed { max-height:480px; overflow:auto; display:block; }
+    footer.small { color:#666; }
+    .active-nav { font-weight:600; text-decoration:underline; }
+    .muted-white { color: rgba(255,255,255,0.85); font-size:0.9rem; }
+    .small-card { font-size:0.9rem; }
+    .badge-template-preview { width:260px; height:140px; object-fit:cover; border-radius:6px; border:1px dashed #ccc; }
+  </style>
+</head>
+<body>
+
+<div class="sidebar">
+  <h4>JOSPIA 2025</h4>
+  <p class="small muted-white">Commission Scientifique</p>
+  <hr style="border-color:rgba(255,255,255,0.15)"/>
+  <nav class="nav flex-column">
+    <a class="nav-link" data-route="dashboard">Dashboard</a>
+    <a class="nav-link" data-route="all">Tous les séminaristes</a>
+    <a class="nav-link" data-route="search">Rechercher</a>
+    <a class="nav-link" data-route="add">Ajouter un séminariste</a>
+
+    <a class="nav-link" data-route="levels">Niveaux ▾</a>
+    <div id="levelsList" style="padding-left:10px;"></div>
+
+    <a class="nav-link" data-route="dortoirs">Dortoirs ▾</a>
+    <div id="dormsList" style="padding-left:10px;"></div>
+
+    <a class="nav-link" data-route="harakas">Groupes Haraka ▾</a>
+    <div id="harakaList" style="padding-left:10px;"></div>
+
+    <a class="nav-link" data-route="export">Export / Import</a>
+
+    <hr style="border-color:rgba(255,255,255,0.15)"/>
+    <div class="small muted-white">Import & photos</div>
+    <a class="nav-link" data-route="import">Importer Excel</a>
+
+    <hr style="border-color:rgba(255,255,255,0.15)"/>
+    <div class="small muted-white">Export</div>
+    <a class="nav-link" id="exportXLSX">Exporter Excel (Nom,Prénom,Genre,Niveau,Dortoir,Haraka)</a>
+    <a class="nav-link text-danger" id="clearAll">Supprimer tout</a>
+  </nav>
+  <hr style="border-color:rgba(255,255,255,0.15)"/>
+  <div class="small muted-white">Local only — pas de serveur</div>
+</div>
+
+<div class="main">
+  <div id="view"></div>
+  <footer class="small mt-4">Prototype client-side — ouvre les pages sans base SQL.</footer>
+</div>
+
+<div id="qrModalContainer"></div>
+
+<script>
+/* ============================
+  Configuration & defaults
+============================ */
+const STORAGE_KEY = 'jospia_manager_custom_v1';
+const MAX_SEMINARISTES = 500;
+const DORTOIRS_FRERES = [
+  "IMAM MÂLIK IBN ANAS",
+  "IMAM ASH-SHÂFI‘Î",
+  "IMAM AHMAD IBN HANBAL",
+  "IMAM ABÛ HANÎFA"
+];
+const DORTOIRS_SOEURS = [
+  "MARYAM BINT ‘IMRÂN",
+  "ASSYA BINT MUZAHIM",
+  "KHADÎJAH BINT KHUWAYLID",
+  "FÂTIMA AZ-ZAHRÂ"
+];
+let halaqaGroupsFreres = [...DORTOIRS_FRERES];
+let halaqaGroupsSoeurs = [...DORTOIRS_SOEURS];
+const HARAKA_KEYS = ['A','B','C','D','E','F'];
+
+/* ============================
+  Helpers: load/save
+============================ */
+function loadHalaqaFromStorage(){
+  const r = localStorage.getItem(STORAGE_KEY + '_halaqa'); 
+  if(r){ const o = JSON.parse(r); halaqaGroupsFreres = o.fr || halaqaGroupsFreres; halaqaGroupsSoeurs = o.so || halaqaGroupsSoeurs; }
+}
+function saveHalaqaToStorage(){ localStorage.setItem(STORAGE_KEY + '_halaqa', JSON.stringify({fr: halaqaGroupsFreres, so: halaqaGroupsSoeurs})); }
+
+function saveData(data){ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
+function loadData(){ const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : []; }
+
+/* ============================
+  Calcul du niveau (nouveau)
+  PRIMAIRE: 0-9
+  SECONDAIRE: 10-14
+  UNIVERSITAIRE: 15+
+============================ */
+function calculerNiveau(note){
+  if (note === null || note === undefined || isNaN(Number(note))) return 'NIVEAU PRIMAIRE';
+  const n = Number(note);
+  if (n <= 9) return 'NIVEAU PRIMAIRE';
+  if (n <= 14) return 'NIVEAU SECONDAIRE';
+  return 'NIVEAU UNIVERSITAIRE';
+}
+
+/* ============================
+  Normaliser genre (M/F)
+============================ */
+function normGenre(g){
+  if(!g) return 'M';
+  const gg = g.toString().trim().toUpperCase();
+  if(gg === 'F' || gg === 'FEMININ' || gg === 'FÉMININ' || gg === 'FEMALE') return 'F';
+  return 'M';
+}
+
+/* ============================
+  Matricule generator
+============================ */
+function genMatricule(index){
+  const num = String(index+1).padStart(4,'0');
+  return `25-JOS${num}`;
+}
+
+/* ============================
+  Assignment logic (matricule, niveau, dortoir, halaqa)
+============================ */
+function ensureAssigned(data){
+  loadHalaqaFromStorage();
+  data.forEach((s, idx) => {
+    if(!s.matricule) s.matricule = genMatricule(idx);
+    s.niveau = calculerNiveau(Number(s.note));
+    // determine dorm by genre
+    const gender = normGenre(s.genre || 'M');
+    const targetDormList = (gender === 'F') ? DORTOIRS_SOEURS : DORTOIRS_FRERES;
+    if(!s.dortoir || ![...DORTOIRS_FRERES,...DORTOIRS_SOEURS].includes(s.dortoir)){
+      s.dortoir = targetDormList[Math.floor(Math.random() * targetDormList.length)];
+    }
+    // halaqa assignment
+    const targetHalaqaList = (gender === 'F') ? halaqaGroupsSoeurs : halaqaGroupsFreres;
+    if(!s.halaqa || !targetHalaqaList.includes(s.halaqa)){
+      s.halaqa = (targetHalaqaList.length>0) ? targetHalaqaList[Math.floor(Math.random() * targetHalaqaList.length)] : '';
+    }
+    if(!s.haraka) s.haraka = `Groupe ${HARAKA_KEYS[idx % HARAKA_KEYS.length]}`;
+    // normalize stored genre
+    s.genre = gender;
+  });
+  return data;
+}
+
+/* ============================
+  Routing & UI helpers
+============================ */
+const view = document.getElementById('view');
+function setActiveNav(route){
+  document.querySelectorAll('.nav-link').forEach(a=>a.classList.remove('active-nav'));
+  const el = document.querySelector(`[data-route="${route}"]`);
+  if(el) el.classList.add('active-nav');
+}
+function routeTo(route, key){
+  setActiveNav(route);
+  if(route==='dashboard') renderDashboard();
+  else if(route==='all') renderAll();
+  else if(route==='levels') renderLevels();
+  else if(route==='level' && key) renderLevelDetail(key);
+  else if(route==='dortoirs') renderDortoirs();
+  else if(route==='dortoir' && key) renderDortoirDetailByName(key);
+  else if(route==='harakas') renderHarakas();
+  else if(route==='haraka' && key) renderHarakaDetail(key);
+  else if(route==='import') renderImport();
+  else if(route==='add') renderAddSeminariste();
+  else if(route==='search') renderSearch();
+  else routeTo('dashboard');
+}
+document.querySelectorAll('[data-route]').forEach(a=>{
+  a.addEventListener('click', e=>{ e.preventDefault(); routeTo(a.getAttribute('data-route')); });
+});
+
+/* rebuild sidebar lists */
+function rebuildSidebarLists(){
+  const lvList = document.getElementById('levelsList'); lvList.innerHTML = '';
+  ['NIVEAU PRIMAIRE','NIVEAU SECONDAIRE','NIVEAU UNIVERSITAIRE'].forEach(l=>{
+    const link = document.createElement('a'); link.href='#'; link.className='nav-link small'; link.textContent=l;
+    link.onclick = e=>{ e.preventDefault(); routeTo('level', l); };
+    lvList.appendChild(link);
+  });
+
+  const dorms = document.getElementById('dormsList'); dorms.innerHTML = '';
+  const dFr = document.createElement('a'); dFr.href='#'; dFr.className='nav-link small'; dFr.textContent='Dortoirs Frères'; dFr.onclick = e=>{ e.preventDefault(); routeTo('dortoirs'); };
+  dorms.appendChild(dFr);
+
+  const hlist = document.getElementById('harakaList'); hlist.innerHTML = '';
+  const aFr = document.createElement('a'); aFr.href='#'; aFr.className='nav-link small'; aFr.textContent='Halaqa Frères'; aFr.onclick = e=>{ e.preventDefault(); routeTo('harakas'); };
+  hlist.appendChild(aFr);
+}
+
+/* ============================
+  Renderers
+============================ */
+function renderDashboard(){
+  rebuildSidebarLists();
+  const data = loadData();
+  const totals = { total: data.length, byLevel: {'NIVEAU PRIMAIRE':0,'NIVEAU SECONDAIRE':0,'NIVEAU UNIVERSITAIRE':0} };
+  data.forEach(s => { totals.byLevel[s.niveau] = (totals.byLevel[s.niveau]||0) + 1; });
+
+  view.innerHTML = `
+    <div class="row g-3">
+      <div class="col-md-3"><div class="card p-3"><h6>Total</h6><h2>${totals.total}</h2></div></div>
+      <div class="col-md-6"><div class="card p-3"><h6>Par niveau</h6>
+        <div class="d-flex gap-3">
+          <div class="p-2 bg-white rounded small-card"><strong>Primaire</strong><div>${totals.byLevel['NIVEAU PRIMAIRE']||0}</div></div>
+          <div class="p-2 bg-white rounded small-card"><strong>Secondaire</strong><div>${totals.byLevel['NIVEAU SECONDAIRE']||0}</div></div>
+          <div class="p-2 bg-white rounded small-card"><strong>Universitaire</strong><div>${totals.byLevel['NIVEAU UNIVERSITAIRE']||0}</div></div>
+        </div>
+      </div></div>
+    </div>
+
+    <div class="mt-3 card p-3"><h6>Actions</h6>
+      <div class="d-flex gap-2 flex-wrap">
+        <button class="btn btn-primary" onclick="routeTo('import')">Importer Excel</button>
+        <button class="btn btn-warning" onclick="routeTo('add')">Ajouter manuel</button>
+        <button class="btn btn-success" id="btnExportQuick">Exporter Excel</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('btnExportQuick').onclick = exportExcel;
+}
+
+function renderAll(){
+  const data = loadData();
+  data.sort((a,b)=> (a.matricule||'').localeCompare(b.matricule||''));
+  const rows = data.map(s=>`<tr>
+    <td>${s.matricule}</td><td>${s.nom}</td><td>${s.prenom}</td><td>${s.age ?? ''}</td><td>${s.note ?? ''}</td><td>${s.genre ?? ''}</td><td>${s.niveau}</td><td>${s.dortoir}</td><td>${s.halaqa || ''}</td>
+    <td><button class="btn btn-sm btn-outline-primary" onclick='editSeminariste("${s.matricule}")'>Modifier</button></td>
+  </tr>`).join('');
+  view.innerHTML = `<div class="card p-3"><h4>Tous les séminaristes (${data.length})</h4>
+    <div class="table-responsive table-fixed mt-2">
+      <table class="table table-sm">
+        <thead class="table-light"><tr><th>Matricule</th><th>Nom</th><th>Prénom</th><th>Âge</th><th>Note</th><th>Genre</th><th>Niveau</th><th>Dortoir</th><th>Halaqa</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div></div>`;
+}
+
+function renderLevels(){
+  const data = loadData();
+  const counts = {'NIVEAU PRIMAIRE':0,'NIVEAU SECONDAIRE':0,'NIVEAU UNIVERSITAIRE':0};
+  data.forEach(s=> counts[s.niveau] = (counts[s.niveau]||0) + 1);
+  view.innerHTML = `<div class="card p-3"><h4>Niveaux</h4>
+    <div class="list-group">
+      <a href="#" class="list-group-item list-group-item-action" onclick="routeTo('level','NIVEAU PRIMAIRE')">NIVEAU PRIMAIRE — ${counts['NIVEAU PRIMAIRE']||0}</a>
+      <a href="#" class="list-group-item list-group-item-action" onclick="routeTo('level','NIVEAU SECONDAIRE')">NIVEAU SECONDAIRE — ${counts['NIVEAU SECONDAIRE']||0}</a>
+      <a href="#" class="list-group-item list-group-item-action" onclick="routeTo('level','NIVEAU UNIVERSITAIRE')">NIVEAU UNIVERSITAIRE — ${counts['NIVEAU UNIVERSITAIRE']||0}</a>
+    </div></div>`;
+}
+
+function renderLevelDetail(levelKey){
+  const data = loadData().filter(s=> s.niveau === levelKey);
+  view.innerHTML = pageListHTML(`${levelKey} (${data.length})`, data) + `<div class="mt-2"><button class="btn btn-sm btn-outline-primary" onclick="exportArrayAsExcel(${JSON.stringify(data)}, '${levelKey.replace(/\s+/g,'_')}.xlsx')">Exporter ${levelKey} en Excel</button></div>`;
+}
+
+function renderDortoirs(){
+  const data = loadData();
+  const counts = {};
+  [...DORTOIRS_FRERES, ...DORTOIRS_SOEURS].forEach(d => counts[d]=0);
+  data.forEach(s => { if(s.dortoir) counts[s.dortoir] = (counts[s.dortoir]||0)+1; });
+  const html = `<div class="card p-3"><h4>Dortoirs</h4><div class="list-group">` + Object.keys(counts).map(d=>`<a href="#" class="list-group-item list-group-item-action" onclick="routeTo('dortoir','${d.replace(/'/g,"\\'")}')">${d} — ${counts[d]}</a>`).join('') + `</div></div>`;
+  view.innerHTML = html;
+}
+function renderDortoirDetailByName(dName){
+  const data = loadData().filter(s=> s.dortoir === dName);
+  view.innerHTML = pageListHTML(`${dName} (${data.length})`, data) + `<div class="mt-2"><button class="btn btn-sm btn-outline-primary" onclick="exportArrayAsExcel(${JSON.stringify(data)}, '${dName.replace(/\s+/g,'_')}.xlsx')">Exporter ${dName} en Excel</button></div>`;
+}
+
+function renderHarakas(){
+  loadHalaqaFromStorage();
+  const lists = { fr: halaqaGroupsFreres, so: halaqaGroupsSoeurs };
+  let html = `<div class="card p-3"><h4>Groupes Halaqa</h4><div class="row">`;
+  html += `<div class="col-md-6"><h5>Frères</h5><div class="list-group">` + lists.fr.map(g=>`<a href="#" class="list-group-item list-group-item-action" onclick="routeTo('haraka','${g.replace(/'/g,"\\'")}')">${g}</a>`).join('') + `</div></div>`;
+  html += `<div class="col-md-6"><h5>Soeurs</h5><div class="list-group">` + lists.so.map(g=>`<a href="#" class="list-group-item list-group-item-action" onclick="routeTo('haraka','${g.replace(/'/g,"\\'")}')">${g}</a>`).join('') + `</div></div>`;
+  html += `</div></div>`;
+  view.innerHTML = html;
+}
+function renderHarakaDetail(name){
+  const data = loadData().filter(s => s.halaqa === name);
+  view.innerHTML = pageListHTML(`Halaqa: ${name} (${data.length})`, data) + `<div class="mt-2"><button class="btn btn-sm btn-outline-primary" onclick="exportArrayAsExcel(${JSON.stringify(data)}, '${name.replace(/\s+/g,'_')}.xlsx')">Exporter ${name} en Excel</button></div>`;
+}
+
+function pageListHTML(title, list){
+  if(!list) list = [];
+  const rows = list.map(s=>`<div class="d-flex align-items-center mb-2 p-2 bg-white rounded">
+    <div style="width:56px">${s.photoDataUrl? `<img src="${s.photoDataUrl}" class="thumb">` : ''}</div>
+    <div style="flex:1"><strong>${s.nom} ${s.prenom}</strong><div class="small">${s.matricule}</div></div>
+    <div style="width:260px">${s.niveau} • ${s.dortoir} • ${s.halaqa || ''}</div>
+    <div style="width:140px; text-align:right"><button class="btn btn-sm btn-outline-primary" onclick='editSeminariste("${s.matricule}")'>Modifier</button></div>
+  </div>`).join('');
+  return `<div class="card p-3"><h4>${title}</h4><div class="mt-3">${rows || '<p>Aucun séminariste</p>'}</div></div>`;
+}
+
+/* ============================
+  Add / Edit seminarist
+============================ */
+function renderAddSeminariste(){
+  rebuildSidebarLists();
+  view.innerHTML = `<div class="card p-3">
+    <h4>Ajouter un séminariste</h4>
+    <div class="row g-3">
+      <div class="col-md-4"><label>Nom</label><input id="addNom" class="form-control" /></div>
+      <div class="col-md-4"><label>Prénom</label><input id="addPrenom" class="form-control" /></div>
+      <div class="col-md-4"><label>Matricule (laisser vide auto)</label><input id="addMat" class="form-control" /></div>
+
+      <div class="col-md-3"><label>Note (0-20)</label><input id="addNote" type="number" min="0" max="20" class="form-control" /></div>
+      <div class="col-md-3"><label>Âge</label><input id="addAge" type="number" min="0" class="form-control" /></div>
+      <div class="col-md-3"><label>Genre</label>
+        <select id="addGenre" class="form-select"><option value="M">M</option><option value="F">F</option></select>
+      </div>
+      <div class="col-md-3"><label>Contact</label><input id="addContact" class="form-control" /></div>
+
+      <div class="col-md-6"><label>Photo (optionnel)</label><input id="addPhoto" type="file" accept="image/*" class="form-control" /></div>
+      <div class="col-md-6"><label>Halaqa (optionnel)</label>
+        <select id="addHalaqaSelect" class="form-select"><option value="">— automatique —</option></select>
+      </div>
+
+      <div class="col-12 text-center mt-3">
+        <button class="btn btn-primary" id="btnAddSeminariste">Ajouter</button>
+      </div>
+    </div>
+  </div>`;
+
+  loadHalaqaFromStorage();
+  const sel = document.getElementById('addHalaqaSelect');
+  sel.innerHTML = `<option value="">— automatique —</option>`;
+  halaqaGroupsFreres.forEach(g => { const o = document.createElement('option'); o.value=g; o.textContent='Frères — '+g; sel.appendChild(o); });
+  halaqaGroupsSoeurs.forEach(g => { const o = document.createElement('option'); o.value=g; o.textContent='Soeurs — '+g; sel.appendChild(o); });
+
+  document.getElementById('btnAddSeminariste').onclick = async ()=>{
+    const nom = document.getElementById('addNom').value.trim();
+    const prenom = document.getElementById('addPrenom').value.trim();
+    const maybeMat = document.getElementById('addMat').value.trim();
+    const note = parseFloat(document.getElementById('addNote').value);
+    const age = parseInt(document.getElementById('addAge').value);
+    const genre = document.getElementById('addGenre').value;
+    const contact = document.getElementById('addContact').value.trim();
+    const selectedHalaqa = document.getElementById('addHalaqaSelect').value || '';
+    const photoFile = document.getElementById('addPhoto').files[0];
+    if(!nom || !prenom) return alert('Nom et prénom obligatoires');
+    let photoDataUrl = '';
+    if(photoFile) photoDataUrl = await readFileAsDataURL(photoFile);
+    const data = loadData();
+    if(data.length >= MAX_SEMINARISTES) return alert('Capacité atteinte');
+    const newItem = { matricule: maybeMat || null, nom, prenom, note: isNaN(note)?null:note, age: isNaN(age)?null:age, genre: normGenre(genre), contact, photoDataUrl, halaqa: selectedHalaqa };
+    data.push(newItem);
+    ensureAssigned(data);
+    saveData(data);
+    rebuildSidebarLists();
+    alert('Séminariste ajouté.');
+    routeTo('all');
+  };
+}
+
+function editSeminariste(matricule){
+  const data = loadData();
+  const s = data.find(x=> x.matricule === matricule);
+  if(!s) return alert('Séminariste non trouvé');
+  view.innerHTML = `<div class="card p-3">
+    <h4>Modifier — ${s.matricule}</h4>
+    <div class="row g-3">
+      <div class="col-md-4"><label>Nom</label><input id="editNom" class="form-control" value="${s.nom || ''}" /></div>
+      <div class="col-md-4"><label>Prénom</label><input id="editPrenom" class="form-control" value="${s.prenom || ''}" /></div>
+      <div class="col-md-4"><label>Matricule</label><input id="editMat" class="form-control" value="${s.matricule || ''}" /></div>
+
+      <div class="col-md-3"><label>Note</label><input id="editNote" type="number" min="0" max="20" class="form-control" value="${s.note ?? ''}" /></div>
+      <div class="col-md-3"><label>Âge</label><input id="editAge" type="number" min="0" class="form-control" value="${s.age ?? ''}" /></div>
+      <div class="col-md-3"><label>Genre</label>
+        <select id="editGenre" class="form-select"><option value="M" ${s.genre==='M'?'selected':''}>M</option><option value="F" ${s.genre==='F'?'selected':''}>F</option></select>
+      </div>
+      <div class="col-md-3"><label>Contact</label><input id="editContact" class="form-control" value="${s.contact || ''}" /></div>
+
+      <div class="col-md-6"><label>Photo (optionnel)</label><input id="editPhoto" type="file" accept="image/*" class="form-control" /></div>
+      <div class="col-md-6"><label>Halaqa (optionnel)</label>
+        <select id="editHalaqaSelect" class="form-select"><option value="">— automatique —</option></select>
+      </div>
+
+      <div class="col-12 text-center mt-3">
+        <button class="btn btn-success" id="btnSaveEdit">Enregistrer</button>
+        <button class="btn btn-danger ms-2" id="btnDelete">Supprimer</button>
+      </div>
+    </div>
+  </div>`;
+  const sel = document.getElementById('editHalaqaSelect');
+  sel.innerHTML = `<option value="">— automatique —</option>`;
+  loadHalaqaFromStorage();
+  halaqaGroupsFreres.forEach(g => { const o=document.createElement('option'); o.value=g; o.textContent='Frères — '+g; sel.appendChild(o); });
+  halaqaGroupsSoeurs.forEach(g => { const o=document.createElement('option'); o.value=g; o.textContent='Soeurs — '+g; sel.appendChild(o); });
+  if(s.halaqa) sel.value = s.halaqa;
+
+  document.getElementById('btnSaveEdit').onclick = async ()=>{
+    const nom = document.getElementById('editNom').value.trim();
+    const prenom = document.getElementById('editPrenom').value.trim();
+    const mat = document.getElementById('editMat').value.trim();
+    const note = parseFloat(document.getElementById('editNote').value);
+    const age = parseInt(document.getElementById('editAge').value);
+    const genre = document.getElementById('editGenre').value;
+    const contact = document.getElementById('editContact').value.trim();
+    const selectedHalaqa = document.getElementById('editHalaqaSelect').value || '';
+    const photoFile = document.getElementById('editPhoto').files[0];
+    if(!nom || !prenom) return alert('Nom et prénom obligatoires');
+    if(photoFile) s.photoDataUrl = await readFileAsDataURL(photoFile);
+    s.nom = nom; s.prenom = prenom; s.matricule = mat || s.matricule; s.note = isNaN(note)?null:note; s.age = isNaN(age)?null:age; s.genre = normGenre(genre); s.contact = contact;
+    if(selectedHalaqa) s.halaqa = selectedHalaqa;
+    ensureAssigned(data); saveData(data); rebuildSidebarLists(); alert('Mis à jour'); routeTo('all');
+  };
+  document.getElementById('btnDelete').onclick = ()=>{
+    if(!confirm('Supprimer ce séminariste ?')) return;
+    const newData = loadData().filter(x=> x.matricule !== matricule);
+    saveData(newData); rebuildSidebarLists(); routeTo('all'); alert('Supprimé');
+  };
+}
+
+/* ============================
+  Search
+============================ */
+function renderSearch(){
+  view.innerHTML = `<div class="card p-3">
+    <h4>Recherche</h4>
+    <div class="mb-2"><input id="searchInput" class="form-control" placeholder="Nom, prénom ou matricule..." /></div>
+    <div id="searchResults"></div>
+  </div>`;
+  const input = document.getElementById('searchInput');
+  const results = document.getElementById('searchResults');
+  input.addEventListener('input', ()=>{
+    const term = input.value.trim().toLowerCase();
+    if(!term){ results.innerHTML=''; return; }
+    const matches = loadData().filter(s=>{
+      return (s.nom && s.nom.toLowerCase().includes(term)) ||
+             (s.prenom && s.prenom.toLowerCase().includes(term)) ||
+             (s.matricule && s.matricule.toLowerCase().includes(term));
+    });
+    results.innerHTML = matches.map(s=>`<div class="d-flex align-items-center mb-2 p-2 bg-white rounded">
+      <div style="width:56px">${s.photoDataUrl? `<img src="${s.photoDataUrl}" class="thumb">` : ''}</div>
+      <div style="flex:1"><strong>${s.nom} ${s.prenom}</strong><div class="small">${s.matricule} • ${s.niveau}</div></div>
+      <div style="width:120px; text-align:right"><button class="btn btn-sm btn-outline-primary" onclick='editSeminariste("${s.matricule}")'>Modifier</button></div>
+    </div>`).join('') || '<p>Aucun résultat</p>';
+  });
+}
+
+/* ============================
+  Import Excel (Nom,Prenom,Age,Note,Genre) - case-insensitive
+============================ */
+function renderImport(){
+  view.innerHTML = `<div class="card p-3">
+    <h4>Importer Excel</h4>
+    <input id="excelFile" type="file" accept=".xlsx,.xls" class="form-control mb-2"/>
+    <button class="btn btn-primary" id="btnImport">Importer</button>
+    <div class="mt-3 small text-muted">Colonnes attendues : Nom, Prenom, Age, Note, Genre (Genre optionnel). La casse n'a pas d'importance.</div>
+  </div>`;
+  document.getElementById('btnImport').onclick = async ()=>{
+    const file = document.getElementById('excelFile').files[0];
+    if(!file) return alert('Sélectionne un fichier');
+    try{
+      const imported = await readExcelFile(file);
+      const current = loadData();
+      const merged = [...current, ...imported];
+      if(merged.length > MAX_SEMINARISTES) return alert('Trop d\'enregistrements');
+      ensureAssigned(merged); saveData(merged); rebuildSidebarLists(); alert('Import terminé'); routeTo('all');
+    }catch(e){ console.error(e); alert('Erreur import'); }
+  };
+}
+function readExcelFile(file){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = (e)=>{
+      try{
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, {type:'array'});
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json(sheet, {defval:''});
+        const rows = json.map(r=>{
+          // map columns case-insensitively
+          const nom = r.Nom || r.NOM || r.nom || r.name || '';
+          const prenom = r.Prenom || r.PRENOM || r.prenom || r.prénom || r.surname || '';
+          const age = r.Age || r.AGE || r.age || '';
+          const note = r.Note || r.NOTE || r.note || '';
+          const genreRaw = r.Genre || r.GENRE || r.genre || r.Sexe || r.sexe || '';
+          const genre = normGenre(genreRaw);
+          return {
+            matricule: null,
+            nom: nom.toString().trim(),
+            prenom: prenom.toString().trim(),
+            age: (age!=='' ? (isNaN(Number(age))?null:Number(age)) : null),
+            note: (note!=='' ? (isNaN(Number(note))?null:Number(note)) : null),
+            genre: genre,
+            contact: r.Contact || r.CONTACT || r.contact || '',
+            photoDataUrl: '',
+            halaqa: ''
+          };
+        }).filter(x => x.nom && x.prenom);
+        resolve(rows);
+      }catch(err){ reject(err); }
+    };
+    reader.onerror = err => reject(err);
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+/* ============================
+  Export Excel (Nom, Prénom, Genre, Niveau, Dortoir, Haraka)
+============================ */
+function exportExcel(){
+  const data = loadData().map(s=>({
+    Nom: s.nom,
+    Prénom: s.prenom,
+    Genre: s.genre || '',
+    Niveau: s.niveau,
+    Dortoir: s.dortoir,
+    Haraka: s.halaqa || s.haraka || ''
+  }));
+  if(!data.length) return alert('Aucune donnée à exporter');
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Séminaristes');
+  XLSX.writeFile(wb, 'seminaristes_export.xlsx');
+}
+document.getElementById('exportXLSX').addEventListener('click', (e)=>{ e.preventDefault(); exportExcel(); });
+
+function exportArrayAsExcel(arr, filename='export.xlsx'){
+  const data = arr.map(s=>({Nom:s.nom, Prenom:s.prenom, Genre: s.genre || '', Niveau:s.niveau, Dortoir:s.dortoir, Haraka: s.halaqa || s.haraka || ''}));
+  if(!data.length) return alert('Aucune donnée à exporter.');
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Export');
+  XLSX.writeFile(wb, filename);
+}
+
+/* ============================
+  Delete all data
+============================ */
+document.getElementById('clearAll').addEventListener('click', deleteAllData);
+function deleteAllData(){
+  if(!confirm('⚠ CONFIRMER : supprimer toutes les données ?')) return;
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(STORAGE_KEY + '_halaqa');
+  rebuildSidebarLists();
+  routeTo('all');
+  alert('Toutes les données ont été supprimées.');
+}
+
+/* ============================
+  Photos helper
+============================ */
+function readFileAsDataURL(file){ return new Promise(resolve=>{ const r=new FileReader(); r.onload=e=>resolve(e.target.result); r.readAsDataURL(file); }); }
+
+/* ============================
+  Initialization
+============================ */
+loadHalaqaFromStorage();
+rebuildSidebarLists();
+routeTo('dashboard');
+
+</script>
+
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
